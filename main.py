@@ -10,9 +10,9 @@ from sklearn.metrics import classification_report, accuracy_score, confusion_mat
 from imblearn.over_sampling import SMOTE
 from imblearn.pipeline import Pipeline as ImbPipeline
 from sklearn.model_selection import cross_val_score, StratifiedKFold
+from sklearn.model_selection import GridSearchCV
 
 # 2. LOAD DATASET
-
 dataset2_path = (
     r'C:\Users\Mayukh\PycharmProjects'
     r'\AI-Powered-Smart-Irrigation-System-for-Predictive-Water-Management'
@@ -98,8 +98,9 @@ print(target_distribution)
 
 
 # 7. TARGET CORRELATION ANALYSIS
+# EDA only — this ordinal encoding is never fed into the model, so using
+# the full dataset here is fine (it doesn't touch anything the model trains on).
 
-# Convert target to numeric only for exploratory correlation analysis
 df_corr = df.copy()
 
 df_corr['Target_Numeric'] = (
@@ -385,49 +386,69 @@ print(df.isnull().sum().sum())
 print("\nTarget distribution:")
 print(df[target_col].value_counts())
 
-# 11. FEATURE ENGINEERING
+# 11. TARGET ENCODING & TRAIN-TEST SPLIT
+# Moved to happen BEFORE feature engineering. Two of the engineered features
+# below (Moisture_Deficit, Rainfall_Moisture_Stress) are built from dataset-wide
+# max() values. Computing those maxes on the full df — as in the original script —
+# lets information about the test set leak into features used for training.
+# Splitting first and deriving those maxes from X_train only closes that gap.
+
+print("\n" + "=" * 70)
+print("TARGET ENCODING & TRAIN-TEST SPLIT")
+print("=" * 70)
+
+target_mapping = {'Low': 0, 'Medium': 1, 'High': 2}
+df['Target_Encoded'] = df[target_col].map(target_mapping)
+
+X_raw = df.drop(columns=[target_col, 'Target_Encoded'])
+y = df['Target_Encoded']
+
+X_train_raw, X_test_raw, y_train, y_test = train_test_split(
+    X_raw, y, test_size=0.20, random_state=42, stratify=y
+)
+
+print(f"Training rows : {X_train_raw.shape[0]}")
+print(f"Testing rows  : {X_test_raw.shape[0]}")
+
+# 12. FEATURE ENGINEERING (stats fit on training data only)
+
 print("\n" + "=" * 70)
 print("FEATURE ENGINEERING")
 print("=" * 70)
 
-# 11.1 Moisture Deficit
-df['Moisture_Deficit'] = (
-    df['Soil_Moisture'].max()
-    - df['Soil_Moisture']
-)
+def engineer_features(X, soil_moisture_max, rainfall_max):
+    """Adds the engineered columns to a copy of X.
 
-# 11.2 Temperature-Humidity Interaction
-df['Temperature_Humidity_Index'] = (
-    df['Temperature_C']
-    * (100 - df['Humidity'])
-)
-# 11.3 Temperature-Wind Interaction
+    soil_moisture_max / rainfall_max are passed in rather than recomputed,
+    so the same TRAINING-derived constants are used for both train and test.
+    """
+    X = X.copy()
 
-df['Heat_Wind_Index'] = (
-    df['Temperature_C']
-    * df['Wind_Speed_kmh']
-)
+    X['Moisture_Deficit'] = soil_moisture_max - X['Soil_Moisture']
 
-# 11.4 Rainfall-Moisture Stress
-df['Rainfall_Moisture_Stress'] = (
-    (
-        df['Rainfall_mm'].max()
-        - df['Rainfall_mm']
+    X['Temperature_Humidity_Index'] = (
+        X['Temperature_C'] * (100 - X['Humidity'])
     )
-    *
-    (
-        df['Soil_Moisture'].max()
-        - df['Soil_Moisture']
+
+    X['Heat_Wind_Index'] = X['Temperature_C'] * X['Wind_Speed_kmh']
+
+    X['Rainfall_Moisture_Stress'] = (
+        (rainfall_max - X['Rainfall_mm'])
+        * (soil_moisture_max - X['Soil_Moisture'])
     )
-)
 
-# 11.5 Previous Irrigation / Soil Moisture Ratio
-df['Previous_Irrigation_Moisture_Ratio'] = (
-    df['Previous_Irrigation_mm']
-    / (df['Soil_Moisture'] + 1)
-)
+    X['Previous_Irrigation_Moisture_Ratio'] = (
+        X['Previous_Irrigation_mm'] / (X['Soil_Moisture'] + 1)
+    )
 
-# 12. ENGINEERED FEATURE SUMMARY
+    return X
+
+# Stats derived from the TRAINING split only
+train_soil_moisture_max = X_train_raw['Soil_Moisture'].max()
+train_rainfall_max = X_train_raw['Rainfall_mm'].max()
+
+X_train_fe = engineer_features(X_train_raw, train_soil_moisture_max, train_rainfall_max)
+X_test_fe = engineer_features(X_test_raw, train_soil_moisture_max, train_rainfall_max)
 
 engineered_features = [
     'Moisture_Deficit',
@@ -438,69 +459,66 @@ engineered_features = [
 ]
 
 print("\nEngineered Features:")
-
 for feature in engineered_features:
     print(f"• {feature}")
 
-print(
-    f"\nOriginal number of features : {original_feature_count}"
-)
+print(f"\nOriginal number of raw feature columns : {X_raw.shape[1]}")
+print(f"Final number of feature columns        : {X_train_fe.shape[1]}")
 
+print("\nEngineered Feature Statistics (training set):")
 print(
-    f"Final number of features    : {df.shape[1]}"
-)
-
-print("\nEngineered Feature Statistics:")
-
-print(
-    df[engineered_features]
+    X_train_fe[engineered_features]
     .describe()
     .T[['mean', 'std', 'min', '50%', 'max']]
 )
 
-# 13. FINAL DATASET PREVIEW
+# 13. TRAINING FEATURE SET PREVIEW (POST-ENGINEERING)
+
 print("\n" + "=" * 70)
-print("FINAL DATASET PREVIEW")
+print("TRAINING FEATURE SET PREVIEW")
 print("=" * 70)
 
-print(df.head().T)
+print(X_train_fe.head().T)
 
-print("\nFinal columns:")
-print(df.columns.tolist())
+print("\nFinal feature columns:")
+print(X_train_fe.columns.tolist())
 
+# 14. CATEGORICAL ENCODING
+# Dummies are fit on the training columns; the test set is then reindexed onto
+# those same columns so a category seen only in one split can't create a
+# train/test column mismatch or a hidden leak.
 
-# 14. MODEL PREPARATION
 print("\n" + "=" * 70)
-print("MODEL PREPARATION")
+print("CATEGORICAL ENCODING")
 print("=" * 70)
 
-# 14.1 Target Encoding
-target_mapping = {'Low': 0, 'Medium': 1, 'High': 2}
-df['Target_Encoded'] = df['Irrigation_Need'].map(target_mapping)
+categorical_features = X_train_fe.select_dtypes(
+    include=['object', 'string']
+).columns
 
-# Separate Features and Target
-X = df.drop(columns=['Irrigation_Need', 'Target_Encoded'])
-y = df['Target_Encoded']
+X_train_encoded = pd.get_dummies(X_train_fe, columns=categorical_features, drop_first=True)
+X_test_encoded = pd.get_dummies(X_test_fe, columns=categorical_features, drop_first=True)
 
-# 14.2 Categorical Encoding (One-Hot)
-categorical_features = X.select_dtypes(include=['object', 'string']).columns
-X_encoded = pd.get_dummies(X, columns=categorical_features, drop_first=True)
+X_test_encoded = X_test_encoded.reindex(columns=X_train_encoded.columns, fill_value=0)
 
-# 14.3 Train-Test Split (80/20 Stratified)
-X_train, X_test, y_train, y_test = train_test_split(
-    X_encoded, y, test_size=0.20, random_state=42, stratify=y
-)
+print(f"Encoded training columns : {X_train_encoded.shape[1]}")
+print(f"Encoded testing columns  : {X_test_encoded.shape[1]}")
 
-# 14.4 Feature Scaling
+# 15. FEATURE SCALING
+
+print("\n" + "=" * 70)
+print("FEATURE SCALING")
+print("=" * 70)
+
 scaler = StandardScaler()
-X_train_scaled = scaler.fit_transform(X_train)
-X_test_scaled = scaler.transform(X_test)
+X_train_scaled = scaler.fit_transform(X_train_encoded)
+X_test_scaled = scaler.transform(X_test_encoded)
 
 print(f"Training features shape : {X_train_scaled.shape}")
 print(f"Testing features shape  : {X_test_scaled.shape}")
 
 
-# 15. BASELINE MODEL - RANDOM FOREST
+# 16. BASELINE MODEL - RANDOM FOREST
 print("\n" + "=" * 70)
 print("BASELINE MODEL: RANDOM FOREST")
 print("=" * 70)
@@ -535,12 +553,12 @@ disp_rf = ConfusionMatrixDisplay(
 )
 
 
-# 16. SMOTE-BALANCED MODEL WITH PROPER CROSS-VALIDATION
+# 17. SMOTE-BALANCED MODEL WITH PROPER CROSS-VALIDATION
 print("\n" + "=" * 70)
 print("SMOTE-BALANCED MODEL: RANDOM FOREST")
 print("=" * 70)
 
-# Preview-only: show what SMOTE does to the class balance.This resampled copy is NOT used for training/CV below — it's just for the printed comparison.
+# Preview-only: show what SMOTE does to the class balance. This resampled copy is NOT used for training/CV below — it's just for the printed comparison.
 X_train_smote_preview, y_train_smote_preview = SMOTE(random_state=42).fit_resample(
     X_train_scaled, y_train
 )
@@ -556,7 +574,9 @@ smote_pipeline = ImbPipeline([
         n_estimators=100,
         max_depth=10,
         random_state=42,
-        n_jobs=-1
+        n_jobs=1  # left at 1 on purpose: this pipeline is also used as the
+                  # estimator inside GridSearchCV(n_jobs=-1) below, and
+                  # nesting two n_jobs=-1 levels causes oversubscription
     ))
 ])
 
@@ -568,7 +588,7 @@ print(f"\nK-Fold Cross Validation Scores: {cv_scores}")
 print(f"Mean CV Accuracy: {cv_scores.mean():.4f} (+/- {cv_scores.std() * 2:.4f})")
 
 # Fit the pipeline on the full training set (SMOTE runs once here, only on training data) and evaluate on the untouched, non-SMOTEd test set.
-# imblearn pipelines only apply the resampler during .fit(), not .predict(),so this single predict() call is all that's needed.
+# imblearn pipelines only apply the resampler during .fit(), not .predict(), so this single predict() call is all that's needed.
 smote_pipeline.fit(X_train_scaled, y_train)
 y_pred_smote_test = smote_pipeline.predict(X_test_scaled)
 
@@ -586,7 +606,7 @@ disp_smote = ConfusionMatrixDisplay(
     display_labels=['Low', 'Medium', 'High']
 )
 
-# 17. CONFUSION MATRIX COMPARISON
+# 18. CONFUSION MATRIX COMPARISON
 
 print("\n" + "=" * 70)
 print("CONFUSION MATRIX COMPARISON: BASELINE vs SMOTE")
@@ -606,7 +626,7 @@ plt.tight_layout()
 plt.savefig('confusion_matrix_comparison.png', dpi=300)
 plt.show()
 
-# 18. CONCLUSION
+# 19. CONCLUSION (BASELINE vs SMOTE)
 
 print("\n" + "=" * 70)
 print("CONCLUSION")
@@ -619,3 +639,73 @@ print(f"SMOTE Random Forest     - Mean CV Accuracy : {cv_scores.mean():.4f} "
 
 better_model = "SMOTE-balanced" if smote_test_accuracy > rf_accuracy else "baseline (class-weighted)"
 print(f"\nBetter-performing model on the held-out test set: {better_model} Random Forest.")
+
+
+# 20. HYPERPARAMETER TUNING (GRIDSEARCHCV)
+
+print("\n" + "=" * 70)
+print("HYPERPARAMETER TUNING: GRIDSEARCHCV")
+print("=" * 70)
+
+# Grid for the 'rf' step in the ImbPipeline
+param_grid = {
+    'rf__n_estimators': [100, 200],
+    'rf__max_depth': [8, 12, 16, None],
+    'rf__min_samples_split': [2, 5, 10],
+    'rf__min_samples_leaf': [1, 2, 4]
+}
+
+# Setup GridSearch with the same Stratified K-Fold CV used above
+grid_search = GridSearchCV(
+    estimator=smote_pipeline,
+    param_grid=param_grid,
+    cv=cv,
+    scoring='accuracy',
+    n_jobs=-1
+)
+
+# Run tuning
+grid_search.fit(X_train_scaled, y_train)
+
+# Best model & parameters
+best_rf_model = grid_search.best_estimator_
+print(f"Best Parameters: {grid_search.best_params_}")
+print(f"Best CV Score: {grid_search.best_score_:.4f}")
+
+# 21. FINAL EVALUATION - TUNED MODEL ON HELD-OUT TEST SET
+# grid_search.best_score_ above is the mean CV accuracy on the training folds —
+# it's a model-selection score, not a generalization estimate. The number that
+# actually belongs in the final comparison is this model's accuracy on the
+# untouched test set.
+
+print("\n" + "=" * 70)
+print("FINAL EVALUATION: TUNED MODEL ON TEST SET")
+print("=" * 70)
+
+y_pred_best = best_rf_model.predict(X_test_scaled)
+best_test_accuracy = accuracy_score(y_test, y_pred_best)
+
+print(f"Tuned Model - Test Accuracy: {best_test_accuracy:.4f}\n")
+
+print("Tuned Model Classification Report:")
+print(classification_report(y_test, y_pred_best, target_names=['Low', 'Medium', 'High']))
+
+cm_best = confusion_matrix(y_test, y_pred_best)
+disp_best = ConfusionMatrixDisplay(
+    confusion_matrix=cm_best,
+    display_labels=['Low', 'Medium', 'High']
+)
+
+plt.figure(figsize=(7, 6))
+disp_best.plot(cmap='Blues', values_format='d', ax=plt.gca())
+plt.title('Tuned Random Forest (Test Set)', fontsize=13, fontweight='bold')
+plt.tight_layout()
+plt.savefig('confusion_matrix_tuned.png', dpi=300)
+plt.show()
+
+print("\n" + "=" * 70)
+print("FINAL MODEL COMPARISON")
+print("=" * 70)
+print(f"Baseline (class-weighted) - Test Accuracy : {rf_accuracy:.4f}")
+print(f"SMOTE-balanced            - Test Accuracy : {smote_test_accuracy:.4f}")
+print(f"Tuned (GridSearchCV)      - Test Accuracy : {best_test_accuracy:.4f}")
