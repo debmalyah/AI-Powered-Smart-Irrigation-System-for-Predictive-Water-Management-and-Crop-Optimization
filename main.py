@@ -1,711 +1,543 @@
-# 1. IMPORT LIBRARIES
-import pandas as pd
+"""
+Usage:
+    python irrigation_prediction_pipeline.py --model both
+    python irrigation_prediction_pipeline.py --model gb --skip-eda
+    python irrigation_prediction_pipeline.py --model rf
+"""
+
+import argparse
+
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.model_selection import train_test_split
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="joblib")
+
+from sklearn.model_selection import (
+    train_test_split, cross_val_score, StratifiedKFold,
+    GridSearchCV, RandomizedSearchCV
+)
 from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import classification_report, accuracy_score, confusion_matrix, ConfusionMatrixDisplay
+from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
+from sklearn.metrics import (
+    classification_report, accuracy_score, confusion_matrix, ConfusionMatrixDisplay
+)
 from imblearn.over_sampling import SMOTE
 from imblearn.pipeline import Pipeline as ImbPipeline
-from sklearn.model_selection import cross_val_score, StratifiedKFold
-from sklearn.model_selection import GridSearchCV
+from scipy.stats import randint, uniform
 
-# 2. LOAD DATASET
-dataset2_path = (
-    r'C:\Users\Mayukh\PycharmProjects'
-    r'\AI-Powered-Smart-Irrigation-System-for-Predictive-Water-Management'
-    r'-and-Crop-Optimization\irrigation_prediction.csv'
+
+TARGET_COL = "Irrigation_Need"
+TARGET_ORDER = ["Low", "Medium", "High"]
+TARGET_MAPPING = {"Low": 0, "Medium": 1, "High": 2}
+
+DATASET_PATH = (
+    r"C:\Users\Mayukh\PycharmProjects"
+    r"\AI-Powered-Smart-Irrigation-System-for-Predictive-Water-Management"
+    r"-and-Crop-Optimization\irrigation_prediction.csv"
 )
 
-df = pd.read_csv(dataset2_path)
 
-# Clean column names immediately after loading
-df.columns = df.columns.str.strip()
+# ---------------------------------------------------------------------------
+# 1. LOAD & CLEAN
+# ---------------------------------------------------------------------------
 
-# Track the raw column count now, before any feature engineering,
-# so later summaries don't rely on a hardcoded number
-original_feature_count = df.shape[1]
+def load_and_clean_data(path: str) -> pd.DataFrame:
+    """Load the CSV and apply the fixed cleaning steps (cheap, always run)."""
 
-# 3. BASIC DATASET INFORMATION
+    df = pd.read_csv(path)
+    df.columns = df.columns.str.strip()
 
-print("=" * 70)
-print("DATASET INFORMATION")
-print("=" * 70)
+    print("=" * 70)
+    print("DATASET INFORMATION")
+    print("=" * 70)
+    print(f"Number of rows    : {df.shape[0]}")
+    print(f"Number of columns : {df.shape[1]}")
 
-print(f"Number of rows    : {df.shape[0]}")
-print(f"Number of columns : {df.shape[1]}")
+    categorical_cols = df.select_dtypes(include=["object", "string"]).columns.tolist()
+    numerical_cols = df.select_dtypes(include=np.number).columns.tolist()
 
-print("\nFirst 3 records:")
-print(df.head(3).T)
+    print("\n" + "=" * 70)
+    print("DATA CLEANING")
+    print("=" * 70)
 
-print("\nColumn Information:")
-df.info()
+    # Duplicates
+    duplicate_count = df.duplicated().sum()
+    print(f"\nDuplicate rows: {duplicate_count}")
+    if duplicate_count > 0:
+        df = df.drop_duplicates().reset_index(drop=True)
+        print("Duplicate rows removed.")
+
+    # Categorical whitespace cleanup
+    for col in categorical_cols:
+        df[col] = df[col].astype(str).str.strip()
+
+    # Infinite values -> NaN
+    infinite_counts = np.isinf(df[numerical_cols]).sum()
+    if infinite_counts.sum() > 0:
+        print(f"\nInfinite values found:\n{infinite_counts[infinite_counts > 0]}")
+        df[numerical_cols] = df[numerical_cols].replace([np.inf, -np.inf], np.nan)
+    else:
+        print("\nNo infinite values found.")
+
+    # Drop rows with any remaining invalid numerics
+    if df[numerical_cols].isnull().sum().sum() > 0:
+        print("\nDropping rows with invalid numerical values.")
+        df = df.dropna().reset_index(drop=True)
+    else:
+        print("No invalid numerical values found.")
+
+    # Validate target
+    invalid_target_rows = df[~df[TARGET_COL].isin(TARGET_ORDER)]
+    if len(invalid_target_rows) > 0:
+        df = df[df[TARGET_COL].isin(TARGET_ORDER)].reset_index(drop=True)
+        print(f"\nRemoved {len(invalid_target_rows)} invalid target records.")
+    else:
+        print("\nAll target values are valid.")
+
+    print("\n" + "=" * 70)
+    print("POST-CLEANING DATASET")
+    print("=" * 70)
+    print(f"Rows    : {df.shape[0]}")
+    print(f"Columns : {df.shape[1]}")
+    print(f"\nTarget distribution:\n{df[TARGET_COL].value_counts()}")
+
+    return df
 
 
-# 4. CATEGORICAL FEATURE ANALYSIS
+# ---------------------------------------------------------------------------
+# 2. EDA (skippable — gated behind --skip-eda since plotting is the slow,
+#    non-essential part when you're just iterating on models)
+# ---------------------------------------------------------------------------
 
-print("\n" + "=" * 70)
-print("CATEGORICAL FEATURE ANALYSIS")
-print("=" * 70)
+def run_eda(df: pd.DataFrame) -> None:
+    categorical_cols = df.select_dtypes(include=["object", "string"]).columns.tolist()
+    numerical_cols = df.select_dtypes(include=np.number).columns.tolist()
 
-categorical_cols = df.select_dtypes(
-    include=['object', 'string']
-).columns.tolist()
+    print("\n" + "=" * 70)
+    print("CATEGORICAL FEATURE ANALYSIS")
+    print("=" * 70)
+    for col in categorical_cols:
+        print(f"{col}: {df[col].nunique()} unique values -> {df[col].unique()}")
 
-for col in categorical_cols:
-    print(
-        f"{col}: "
-        f"{df[col].nunique()} unique values -> "
-        f"{df[col].unique()}"
+    print("\n" + "=" * 70)
+    print("NUMERICAL FEATURE ANALYSIS")
+    print("=" * 70)
+    print(df[numerical_cols].describe().T[["mean", "std", "min", "50%", "max"]])
+
+    print("\n" + "=" * 70)
+    print("TARGET VARIABLE ANALYSIS")
+    print("=" * 70)
+    print("\nTarget Class Distribution (%):")
+    print(df[TARGET_COL].value_counts(normalize=True).mul(100).round(2))
+
+    # Correlation with target — EDA-only ordinal encoding, never fed to the model
+    df_corr = df.copy()
+    df_corr["Target_Numeric"] = df_corr[TARGET_COL].map(TARGET_MAPPING)
+    target_correlations = (
+        df_corr.select_dtypes(include=np.number)
+        .corr()["Target_Numeric"]
+        .drop("Target_Numeric")
+        .sort_values(ascending=False)
     )
+    print("\nCorrelation with Irrigation Need:")
+    print(target_correlations.round(3))
 
-# 5. NUMERICAL FEATURE ANALYSIS
+    sns.set_theme(style="whitegrid")
+    plt.rcParams.update({"font.size": 10})
 
-print("\n" + "=" * 70)
-print("NUMERICAL FEATURE ANALYSIS")
-print("=" * 70)
+    plt.figure(figsize=(8, 5))
+    sns.countplot(data=df, x=TARGET_COL, order=TARGET_ORDER)
+    plt.title("Target Class Distribution: Irrigation Need", fontsize=13, fontweight="bold")
+    plt.xlabel("Irrigation Need Level")
+    plt.ylabel("Number of Fields")
+    plt.tight_layout()
+    plt.savefig("target_class_distribution.png", dpi=300)
+    plt.show()
 
-numerical_cols = df.select_dtypes(
-    include=np.number
-).columns.tolist()
+    plt.figure(figsize=(8, 5))
+    sns.boxplot(data=df, x=TARGET_COL, y="Soil_Moisture", order=TARGET_ORDER)
+    plt.title("Soil Moisture vs Irrigation Need", fontsize=13, fontweight="bold")
+    plt.xlabel("Irrigation Need Level")
+    plt.ylabel("Soil Moisture (%)")
+    plt.tight_layout()
+    plt.savefig("soil_moisture_vs_irrigation.png", dpi=300)
+    plt.show()
 
-print(
-    df[numerical_cols]
-    .describe()
-    .T[['mean', 'std', 'min', '50%', 'max']]
-)
-
-
-# 6. TARGET VARIABLE ANALYSIS
-
-print("\n" + "=" * 70)
-print("TARGET VARIABLE ANALYSIS")
-print("=" * 70)
-
-target_col = 'Irrigation_Need'
-
-target_distribution = (
-    df[target_col]
-    .value_counts(normalize=True)
-    .mul(100)
-    .round(2)
-)
-
-print("\nTarget Class Distribution (%):")
-print(target_distribution)
-
-
-# 7. TARGET CORRELATION ANALYSIS
-# EDA only — this ordinal encoding is never fed into the model, so using
-# the full dataset here is fine (it doesn't touch anything the model trains on).
-
-df_corr = df.copy()
-
-df_corr['Target_Numeric'] = (
-    df_corr[target_col]
-    .map({
-        'Low': 0,
-        'Medium': 1,
-        'High': 2
-    })
-)
-
-correlation_df = df_corr.select_dtypes(
-    include=np.number
-)
-
-target_correlations = (
-    correlation_df
-    .corr()['Target_Numeric']
-    .drop('Target_Numeric')
-    .sort_values(ascending=False)
-)
-
-print("\nCorrelation with Irrigation Need:")
-print(target_correlations.round(3))
-
-
-# 8. DATA VISUALIZATION
-
-sns.set_theme(style="whitegrid")
-plt.rcParams.update({'font.size': 10})
-
-target_order = ['Low', 'Medium', 'High']
-
-
-# 8.1 Target Class Distribution
-plt.figure(figsize=(8, 5))
-
-sns.countplot(
-    data=df,
-    x=target_col,
-    order=target_order
-)
-
-plt.title(
-    'Target Class Distribution: Irrigation Need',
-    fontsize=13,
-    fontweight='bold'
-)
-
-plt.xlabel('Irrigation Need Level')
-plt.ylabel('Number of Fields')
-
-plt.tight_layout()
-plt.savefig(
-    'target_class_distribution.png',
-    dpi=300
-)
-plt.show()
-
-# 8.2 Soil Moisture vs Irrigation Need
-plt.figure(figsize=(8, 5))
-
-sns.boxplot(
-    data=df,
-    x=target_col,
-    y='Soil_Moisture',
-    order=target_order
-)
-
-plt.title(
-    'Soil Moisture vs Irrigation Need',
-    fontsize=13,
-    fontweight='bold'
-)
-
-plt.xlabel('Irrigation Need Level')
-plt.ylabel('Soil Moisture (%)')
-
-plt.tight_layout()
-plt.savefig(
-    'soil_moisture_vs_irrigation.png',
-    dpi=300
-)
-plt.show()
-
-# 8.3 Temperature vs Humidity
-plt.figure(figsize=(8, 5))
-
-sns.scatterplot(
-    data=df,
-    x='Temperature_C',
-    y='Humidity',
-    hue=target_col,
-    hue_order=target_order,
-    alpha=0.7
-)
-
-plt.title(
-    'Temperature vs Humidity by Irrigation Need',
-    fontsize=13,
-    fontweight='bold'
-)
-
-plt.xlabel('Temperature (°C)')
-plt.ylabel('Humidity (%)')
-
-plt.tight_layout()
-plt.savefig(
-    'temperature_humidity_irrigation.png',
-    dpi=300
-)
-plt.show()
-
-# 8.4 Crop Type vs Irrigation Need
-crop_target_props = pd.crosstab(
-    df['Crop_Type'],
-    df[target_col],
-    normalize='index'
-)[target_order]
-
-plt.figure(figsize=(9, 5))
-
-crop_target_props.plot(
-    kind='bar',
-    stacked=True,
-    ax=plt.gca(),
-    edgecolor='black'
-)
-
-plt.title(
-    'Irrigation Need Proportion by Crop Type',
-    fontsize=13,
-    fontweight='bold'
-)
-
-plt.xlabel('Crop Type')
-plt.ylabel('Proportion')
-
-plt.xticks(rotation=30)
-plt.legend(
-    title='Irrigation Need',
-    bbox_to_anchor=(1.02, 1),
-    loc='upper left'
-)
-
-plt.tight_layout()
-plt.savefig(
-    'crop_type_irrigation_need.png',
-    dpi=300
-)
-plt.show()
-
-# 8.5 Numerical Feature Correlation Heatmap
-plt.figure(figsize=(11, 8))
-
-correlation_matrix = df[numerical_cols].corr()
-
-sns.heatmap(
-    correlation_matrix,
-    annot=True,
-    fmt='.2f',
-    cmap='vlag',
-    center=0,
-    linewidths=0.5
-)
-
-plt.title(
-    'Numerical Feature Correlation Matrix',
-    fontsize=13,
-    fontweight='bold'
-)
-
-plt.tight_layout()
-plt.savefig(
-    'correlation_heatmap.png',
-    dpi=300
-)
-plt.show()
-
-# 9. DATA CLEANING
-
-print("\n" + "=" * 70)
-print("DATA CLEANING")
-print("=" * 70)
-
-# 9.1 Missing Value Check
-print("\nMissing Values:")
-
-missing_values = df.isnull().sum()
-
-if missing_values.sum() == 0:
-    print("No missing values found.")
-else:
-    print(missing_values[missing_values > 0])
-
-# 9.2 Duplicate Check
-duplicate_count = df.duplicated().sum()
-
-print("\nDuplicate Rows:")
-print(f"Number of duplicate rows: {duplicate_count}")
-
-if duplicate_count > 0:
-    df = df.drop_duplicates().reset_index(drop=True)
-    print("Duplicate rows removed.")
-else:
-    print("No duplicate rows found.")
-
-# 9.3 Clean Categorical Values
-# Reuses categorical_cols from section 4 — columns haven't changed,
-# only rows, so recomputing it here was redundant
-for col in categorical_cols:
-    df[col] = df[col].astype(str).str.strip()
-
-print("\nCategorical values cleaned.")
-
-# 9.4 Infinite Value Check
-infinite_counts = np.isinf(
-    df[numerical_cols]
-).sum()
-
-print("\nInfinite Values:")
-
-if infinite_counts.sum() == 0:
-    print("No infinite values found.")
-else:
-    print(infinite_counts[infinite_counts > 0])
-
-    # Replace infinite values with NaN
-    df[numerical_cols] = df[numerical_cols].replace(
-        [np.inf, -np.inf],
-        np.nan
+    plt.figure(figsize=(8, 5))
+    sns.scatterplot(
+        data=df, x="Temperature_C", y="Humidity",
+        hue=TARGET_COL, hue_order=TARGET_ORDER, alpha=0.7
     )
+    plt.title("Temperature vs Humidity by Irrigation Need", fontsize=13, fontweight="bold")
+    plt.xlabel("Temperature (°C)")
+    plt.ylabel("Humidity (%)")
+    plt.tight_layout()
+    plt.savefig("temperature_humidity_irrigation.png", dpi=300)
+    plt.show()
 
-# 9.5 Handle Invalid Numerical Values
-if df[numerical_cols].isnull().sum().sum() > 0:
+    crop_target_props = pd.crosstab(
+        df["Crop_Type"], df[TARGET_COL], normalize="index"
+    )[TARGET_ORDER]
+    plt.figure(figsize=(9, 5))
+    crop_target_props.plot(kind="bar", stacked=True, ax=plt.gca(), edgecolor="black")
+    plt.title("Irrigation Need Proportion by Crop Type", fontsize=13, fontweight="bold")
+    plt.xlabel("Crop Type")
+    plt.ylabel("Proportion")
+    plt.xticks(rotation=30)
+    plt.legend(title="Irrigation Need", bbox_to_anchor=(1.02, 1), loc="upper left")
+    plt.tight_layout()
+    plt.savefig("crop_type_irrigation_need.png", dpi=300)
+    plt.show()
 
-    print("\nRows containing invalid numerical values:")
-    print(
-        df[
-            df[numerical_cols]
-            .isnull()
-            .any(axis=1)
-        ]
+    plt.figure(figsize=(11, 8))
+    sns.heatmap(
+        df[numerical_cols].corr(), annot=True, fmt=".2f",
+        cmap="vlag", center=0, linewidths=0.5
     )
+    plt.title("Numerical Feature Correlation Matrix", fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig("correlation_heatmap.png", dpi=300)
+    plt.show()
 
-    df = df.dropna().reset_index(drop=True)
 
-else:
-    print("\nNo invalid numerical values found.")
+# ---------------------------------------------------------------------------
+# 3. PREPROCESSING (split -> feature engineering -> encode -> scale)
+#    Split happens BEFORE feature engineering so the engineered features
+#    (which use dataset max() values) are built from TRAINING stats only —
+#    otherwise test-set information leaks into training features.
+# ---------------------------------------------------------------------------
 
-# 9.6 Validate Target Variable
-valid_targets = ['Low', 'Medium', 'High']
-
-invalid_target_rows = df[
-    ~df[target_col].isin(valid_targets)
-]
-
-print("\nTarget Validation:")
-print(f"Invalid target records: {len(invalid_target_rows)}")
-
-if len(invalid_target_rows) > 0:
-
-    df = df[
-        df[target_col].isin(valid_targets)
-    ].reset_index(drop=True)
-
-    print("Invalid target records removed.")
-else:
-    print("All target values are valid.")
-
-# 10. DATASET STATUS AFTER CLEANING
-
-print("\n" + "=" * 70)
-print("POST-CLEANING DATASET")
-print("=" * 70)
-
-print(f"Rows    : {df.shape[0]}")
-print(f"Columns : {df.shape[1]}")
-
-print("\nRemaining missing values:")
-print(df.isnull().sum().sum())
-
-print("\nTarget distribution:")
-print(df[target_col].value_counts())
-
-# 11. TARGET ENCODING & TRAIN-TEST SPLIT
-# Moved to happen BEFORE feature engineering. Two of the engineered features
-# below (Moisture_Deficit, Rainfall_Moisture_Stress) are built from dataset-wide
-# max() values. Computing those maxes on the full df — as in the original script —
-# lets information about the test set leak into features used for training.
-# Splitting first and deriving those maxes from X_train only closes that gap.
-
-print("\n" + "=" * 70)
-print("TARGET ENCODING & TRAIN-TEST SPLIT")
-print("=" * 70)
-
-target_mapping = {'Low': 0, 'Medium': 1, 'High': 2}
-df['Target_Encoded'] = df[target_col].map(target_mapping)
-
-X_raw = df.drop(columns=[target_col, 'Target_Encoded'])
-y = df['Target_Encoded']
-
-X_train_raw, X_test_raw, y_train, y_test = train_test_split(
-    X_raw, y, test_size=0.20, random_state=42, stratify=y
-)
-
-print(f"Training rows : {X_train_raw.shape[0]}")
-print(f"Testing rows  : {X_test_raw.shape[0]}")
-
-# 12. FEATURE ENGINEERING (stats fit on training data only)
-
-print("\n" + "=" * 70)
-print("FEATURE ENGINEERING")
-print("=" * 70)
-
-def engineer_features(X, soil_moisture_max, rainfall_max):
-    """Adds the engineered columns to a copy of X.
-
-    soil_moisture_max / rainfall_max are passed in rather than recomputed,
-    so the same TRAINING-derived constants are used for both train and test.
-    """
+def engineer_features(X: pd.DataFrame, soil_moisture_max: float, rainfall_max: float) -> pd.DataFrame:
     X = X.copy()
-
-    X['Moisture_Deficit'] = soil_moisture_max - X['Soil_Moisture']
-
-    X['Temperature_Humidity_Index'] = (
-        X['Temperature_C'] * (100 - X['Humidity'])
+    X["Moisture_Deficit"] = soil_moisture_max - X["Soil_Moisture"]
+    X["Temperature_Humidity_Index"] = X["Temperature_C"] * (100 - X["Humidity"])
+    X["Heat_Wind_Index"] = X["Temperature_C"] * X["Wind_Speed_kmh"]
+    X["Rainfall_Moisture_Stress"] = (
+        (rainfall_max - X["Rainfall_mm"]) * (soil_moisture_max - X["Soil_Moisture"])
     )
-
-    X['Heat_Wind_Index'] = X['Temperature_C'] * X['Wind_Speed_kmh']
-
-    X['Rainfall_Moisture_Stress'] = (
-        (rainfall_max - X['Rainfall_mm'])
-        * (soil_moisture_max - X['Soil_Moisture'])
+    X["Previous_Irrigation_Moisture_Ratio"] = (
+        X["Previous_Irrigation_mm"] / (X["Soil_Moisture"] + 1)
     )
-
-    X['Previous_Irrigation_Moisture_Ratio'] = (
-        X['Previous_Irrigation_mm'] / (X['Soil_Moisture'] + 1)
-    )
-
     return X
 
-# Stats derived from the TRAINING split only
-train_soil_moisture_max = X_train_raw['Soil_Moisture'].max()
-train_rainfall_max = X_train_raw['Rainfall_mm'].max()
 
-X_train_fe = engineer_features(X_train_raw, train_soil_moisture_max, train_rainfall_max)
-X_test_fe = engineer_features(X_test_raw, train_soil_moisture_max, train_rainfall_max)
+def preprocess(df: pd.DataFrame):
+    print("\n" + "=" * 70)
+    print("TARGET ENCODING & TRAIN-TEST SPLIT")
+    print("=" * 70)
 
-engineered_features = [
-    'Moisture_Deficit',
-    'Temperature_Humidity_Index',
-    'Heat_Wind_Index',
-    'Rainfall_Moisture_Stress',
-    'Previous_Irrigation_Moisture_Ratio'
-]
+    df = df.copy()
+    df["Target_Encoded"] = df[TARGET_COL].map(TARGET_MAPPING)
 
-print("\nEngineered Features:")
-for feature in engineered_features:
-    print(f"• {feature}")
+    X_raw = df.drop(columns=[TARGET_COL, "Target_Encoded"])
+    y = df["Target_Encoded"]
 
-print(f"\nOriginal number of raw feature columns : {X_raw.shape[1]}")
-print(f"Final number of feature columns        : {X_train_fe.shape[1]}")
+    X_train_raw, X_test_raw, y_train, y_test = train_test_split(
+        X_raw, y, test_size=0.20, random_state=42, stratify=y
+    )
+    print(f"Training rows : {X_train_raw.shape[0]}")
+    print(f"Testing rows  : {X_test_raw.shape[0]}")
 
-print("\nEngineered Feature Statistics (training set):")
-print(
-    X_train_fe[engineered_features]
-    .describe()
-    .T[['mean', 'std', 'min', '50%', 'max']]
-)
+    print("\n" + "=" * 70)
+    print("FEATURE ENGINEERING")
+    print("=" * 70)
 
-# 13. TRAINING FEATURE SET PREVIEW (POST-ENGINEERING)
+    train_soil_moisture_max = X_train_raw["Soil_Moisture"].max()
+    train_rainfall_max = X_train_raw["Rainfall_mm"].max()
 
-print("\n" + "=" * 70)
-print("TRAINING FEATURE SET PREVIEW")
-print("=" * 70)
+    X_train_fe = engineer_features(X_train_raw, train_soil_moisture_max, train_rainfall_max)
+    X_test_fe = engineer_features(X_test_raw, train_soil_moisture_max, train_rainfall_max)
+    print(f"Feature columns after engineering: {X_train_fe.shape[1]}")
 
-print(X_train_fe.head().T)
+    print("\n" + "=" * 70)
+    print("CATEGORICAL ENCODING")
+    print("=" * 70)
 
-print("\nFinal feature columns:")
-print(X_train_fe.columns.tolist())
+    categorical_features = X_train_fe.select_dtypes(include=["object", "string"]).columns
+    X_train_encoded = pd.get_dummies(X_train_fe, columns=categorical_features, drop_first=True)
+    X_test_encoded = pd.get_dummies(X_test_fe, columns=categorical_features, drop_first=True)
+    # Reindex test onto training columns so a category seen in only one split
+    # can't create a mismatch or a hidden leak.
+    X_test_encoded = X_test_encoded.reindex(columns=X_train_encoded.columns, fill_value=0)
+    print(f"Encoded columns: {X_train_encoded.shape[1]}")
 
-# 14. CATEGORICAL ENCODING
-# Dummies are fit on the training columns; the test set is then reindexed onto
-# those same columns so a category seen only in one split can't create a
-# train/test column mismatch or a hidden leak.
+    print("\n" + "=" * 70)
+    print("FEATURE SCALING")
+    print("=" * 70)
 
-print("\n" + "=" * 70)
-print("CATEGORICAL ENCODING")
-print("=" * 70)
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train_encoded)
+    X_test_scaled = scaler.transform(X_test_encoded)
+    print(f"Training features shape : {X_train_scaled.shape}")
+    print(f"Testing features shape  : {X_test_scaled.shape}")
 
-categorical_features = X_train_fe.select_dtypes(
-    include=['object', 'string']
-).columns
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
-X_train_encoded = pd.get_dummies(X_train_fe, columns=categorical_features, drop_first=True)
-X_test_encoded = pd.get_dummies(X_test_fe, columns=categorical_features, drop_first=True)
-
-X_test_encoded = X_test_encoded.reindex(columns=X_train_encoded.columns, fill_value=0)
-
-print(f"Encoded training columns : {X_train_encoded.shape[1]}")
-print(f"Encoded testing columns  : {X_test_encoded.shape[1]}")
-
-# 15. FEATURE SCALING
-
-print("\n" + "=" * 70)
-print("FEATURE SCALING")
-print("=" * 70)
-
-scaler = StandardScaler()
-X_train_scaled = scaler.fit_transform(X_train_encoded)
-X_test_scaled = scaler.transform(X_test_encoded)
-
-print(f"Training features shape : {X_train_scaled.shape}")
-print(f"Testing features shape  : {X_test_scaled.shape}")
+    return X_train_scaled, X_test_scaled, y_train, y_test, cv
 
 
-# 16. BASELINE MODEL - RANDOM FOREST
-print("\n" + "=" * 70)
-print("BASELINE MODEL: RANDOM FOREST")
-print("=" * 70)
+# ---------------------------------------------------------------------------
+# 4. RANDOM FOREST BRANCH — baseline, SMOTE+CV, GridSearchCV, final eval
+# ---------------------------------------------------------------------------
 
-# Initialize the model with balanced class weights
-rf_model = RandomForestClassifier(
-    n_estimators=100,
-    max_depth=10, # Limits depth to prevent overfitting
-    class_weight='balanced',
-    random_state=42,
-    n_jobs=-1 # Utilizes all CPU cores for faster training
-)
+def run_random_forest(X_train_scaled, X_test_scaled, y_train, y_test, cv):
+    print("\n" + "=" * 70)
+    print("BASELINE MODEL: RANDOM FOREST")
+    print("=" * 70)
 
-# Train the model
-rf_model.fit(X_train_scaled, y_train)
+    rf_model = RandomForestClassifier(
+        n_estimators=100, max_depth=10, class_weight="balanced",
+        random_state=42, n_jobs=-1
+    )
+    rf_model.fit(X_train_scaled, y_train)
+    y_pred_rf = rf_model.predict(X_test_scaled)
+    rf_accuracy = accuracy_score(y_test, y_pred_rf)
+    print(f"Overall Accuracy: {rf_accuracy:.4f}\n")
+    print(classification_report(y_test, y_pred_rf, target_names=TARGET_ORDER))
 
-# Generate predictions on the unseen test set
-y_pred_rf = rf_model.predict(X_test_scaled)
+    cm_rf = confusion_matrix(y_test, y_pred_rf)
+    disp_rf = ConfusionMatrixDisplay(confusion_matrix=cm_rf, display_labels=TARGET_ORDER)
 
-# Evaluate performance
-rf_accuracy = accuracy_score(y_test, y_pred_rf)
-print(f"Overall Accuracy: {rf_accuracy:.4f}\n")
+    print("\n" + "=" * 70)
+    print("SMOTE-BALANCED MODEL: RANDOM FOREST")
+    print("=" * 70)
 
-print("Classification Report:")
-print(classification_report(y_test, y_pred_rf, target_names=['Low', 'Medium', 'High']))
+    # SMOTE must live INSIDE the pipeline so cross_val_score refits it fresh on
+    # each fold's training split only — resampling once beforehand would let
+    # synthetic points derived from a validation fold's neighbors leak into
+    # the training folds and inflate CV scores.
+    smote_pipeline = ImbPipeline([
+        ("smote", SMOTE(random_state=42)),
+        ("rf", RandomForestClassifier(
+            n_estimators=100, max_depth=10, random_state=42,
+            n_jobs=1  # left at 1: this pipeline is also the GridSearchCV
+                      # estimator below, and nesting two n_jobs=-1 oversubscribes
+        )),
+    ])
 
-# Generate the Confusion Matrix (plotted together with the SMOTE model's below)
-cm_rf = confusion_matrix(y_test, y_pred_rf)
-disp_rf = ConfusionMatrixDisplay(
-    confusion_matrix=cm_rf,
-    display_labels=['Low', 'Medium', 'High']
-)
+    cv_scores = cross_val_score(smote_pipeline, X_train_scaled, y_train, cv=cv, scoring="accuracy")
+    print(f"Mean CV Accuracy: {cv_scores.mean():.4f} (+/- {cv_scores.std() * 2:.4f})")
+
+    smote_pipeline.fit(X_train_scaled, y_train)
+    y_pred_smote_test = smote_pipeline.predict(X_test_scaled)
+    smote_test_accuracy = accuracy_score(y_test, y_pred_smote_test)
+    print(f"SMOTE Model Test Accuracy: {smote_test_accuracy:.4f}\n")
+    print(classification_report(y_test, y_pred_smote_test, target_names=TARGET_ORDER))
+
+    cm_smote = confusion_matrix(y_test, y_pred_smote_test)
+    disp_smote = ConfusionMatrixDisplay(confusion_matrix=cm_smote, display_labels=TARGET_ORDER)
+
+    fig, (ax_rf, ax_smote) = plt.subplots(1, 2, figsize=(14, 6))
+    disp_rf.plot(cmap="Blues", ax=ax_rf, values_format="d", colorbar=False)
+    ax_rf.set_title("Baseline (Class-Weighted)", fontsize=12, fontweight="bold")
+    disp_smote.plot(cmap="Blues", ax=ax_smote, values_format="d", colorbar=False)
+    ax_smote.set_title("SMOTE-Balanced", fontsize=12, fontweight="bold")
+    fig.suptitle("Random Forest Confusion Matrices", fontsize=14, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig("confusion_matrix_comparison.png", dpi=300)
+    plt.show()
+
+    # Kept as GridSearchCV: the grid is small (2*4*3*3 = 72 combinations), so
+    # exhaustive search is cheap and guarantees the true best combination in
+    # the grid rather than a sampled approximation.
+    print("\n" + "=" * 70)
+    print("HYPERPARAMETER TUNING: GRIDSEARCHCV")
+    print("=" * 70)
+
+    param_grid = {
+        "rf__n_estimators": [100, 200],
+        "rf__max_depth": [8, 12, 16, None],
+        "rf__min_samples_split": [2, 5, 10],
+        "rf__min_samples_leaf": [1, 2, 4],
+    }
+    grid_search = GridSearchCV(
+        estimator=smote_pipeline, param_grid=param_grid,
+        cv=cv, scoring="accuracy", n_jobs=-1
+    )
+    grid_search.fit(X_train_scaled, y_train)
+    best_rf_model = grid_search.best_estimator_
+    print(f"Best Parameters: {grid_search.best_params_}")
+    print(f"Best CV Score: {grid_search.best_score_:.4f}")
+
+    print("\n" + "=" * 70)
+    print("FINAL EVALUATION: TUNED RANDOM FOREST ON TEST SET")
+    print("=" * 70)
+
+    y_pred_best = best_rf_model.predict(X_test_scaled)
+    best_test_accuracy = accuracy_score(y_test, y_pred_best)
+    print(f"Tuned Model - Test Accuracy: {best_test_accuracy:.4f}\n")
+    print(classification_report(y_test, y_pred_best, target_names=TARGET_ORDER))
+
+    cm_best = confusion_matrix(y_test, y_pred_best)
+    disp_best = ConfusionMatrixDisplay(confusion_matrix=cm_best, display_labels=TARGET_ORDER)
+    plt.figure(figsize=(7, 6))
+    disp_best.plot(cmap="Blues", values_format="d", ax=plt.gca())
+    plt.title("Tuned Random Forest (Test Set)", fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig("confusion_matrix_tuned.png", dpi=300)
+    plt.show()
+
+    print("\nFINAL RANDOM FOREST COMPARISON")
+    print(f"Baseline (class-weighted) - Test Accuracy : {rf_accuracy:.4f}")
+    print(f"SMOTE-balanced            - Test Accuracy : {smote_test_accuracy:.4f}")
+    print(f"Tuned (GridSearchCV)      - Test Accuracy : {best_test_accuracy:.4f}")
+
+    return {"best_model": best_rf_model, "test_accuracy": best_test_accuracy}
 
 
-# 17. SMOTE-BALANCED MODEL WITH PROPER CROSS-VALIDATION
-print("\n" + "=" * 70)
-print("SMOTE-BALANCED MODEL: RANDOM FOREST")
-print("=" * 70)
+# ---------------------------------------------------------------------------
+# 5. GRADIENT BOOSTING BRANCH — baseline, SMOTE+CV, RandomizedSearchCV, final eval
+#    Uses HistGradientBoostingClassifier + early stopping for speed (see
+#    module docstring). A separate, lighter 3-fold CV is used just for the
+#    randomized search itself to further cut runtime; the reported CV-score
+#    comparisons elsewhere still use the standard 5-fold `cv` for consistency
+#    with the Random Forest numbers.
+# ---------------------------------------------------------------------------
 
-# Preview-only: show what SMOTE does to the class balance. This resampled copy is NOT used for training/CV below — it's just for the printed comparison.
-X_train_smote_preview, y_train_smote_preview = SMOTE(random_state=42).fit_resample(
-    X_train_scaled, y_train
-)
-print(f"Original training target distribution:\n{y_train.value_counts()}")
-print(f"SMOTE training target distribution (preview):\n{y_train_smote_preview.value_counts()}")
+def make_hgb(random_state=42):
+    return HistGradientBoostingClassifier(
+        random_state=random_state,
+        early_stopping=True,
+        validation_fraction=0.1,
+        n_iter_no_change=10,
+    )
 
-# NOTE: SMOTE must be applied *inside* cross-validation, not once on the whole training set beforehand. Resampling first and then doing K-Fold CV
-# on the resampled data lets synthetic samples derived from a validation fold's neighbors leak into the training folds, inflating CV scores.
-# Wrapping SMOTE + the classifier in an imblearn Pipeline fixes this: cross_val_score re-fits SMOTE fresh on each fold's training split only.
-smote_pipeline = ImbPipeline([
-    ('smote', SMOTE(random_state=42)),
-    ('rf', RandomForestClassifier(
-        n_estimators=100,
-        max_depth=10,
+
+def run_gradient_boosting(X_train_scaled, X_test_scaled, y_train, y_test, cv):
+    print("\n" + "=" * 70)
+    print("BASELINE MODEL: GRADIENT BOOSTING (HistGradientBoosting)")
+    print("=" * 70)
+
+    gb_model = make_hgb()
+    gb_model.fit(X_train_scaled, y_train)
+    y_pred_gb = gb_model.predict(X_test_scaled)
+    gb_accuracy = accuracy_score(y_test, y_pred_gb)
+    print(f"Overall Accuracy: {gb_accuracy:.4f}\n")
+    print(classification_report(y_test, y_pred_gb, target_names=TARGET_ORDER))
+
+    print("\n" + "=" * 70)
+    print("SMOTE-BALANCED MODEL: GRADIENT BOOSTING")
+    print("=" * 70)
+
+    smote_gb_pipeline = ImbPipeline([
+        ("smote", SMOTE(random_state=42)),
+        ("gb", make_hgb()),
+    ])
+
+    gb_cv_scores = cross_val_score(
+        smote_gb_pipeline, X_train_scaled, y_train, cv=cv, scoring="accuracy", n_jobs=-1
+    )
+    print(f"Mean CV Accuracy: {gb_cv_scores.mean():.4f} (+/- {gb_cv_scores.std() * 2:.4f})")
+
+    smote_gb_pipeline.fit(X_train_scaled, y_train)
+    y_pred_smote_gb = smote_gb_pipeline.predict(X_test_scaled)
+    smote_gb_test_accuracy = accuracy_score(y_test, y_pred_smote_gb)
+    print(f"SMOTE Model Test Accuracy: {smote_gb_test_accuracy:.4f}\n")
+    print(classification_report(y_test, y_pred_smote_gb, target_names=TARGET_ORDER))
+
+    print("\n" + "=" * 70)
+    print("HYPERPARAMETER TUNING: GRADIENT BOOSTING (RandomizedSearchCV)")
+    print("=" * 70)
+
+    # max_iter replaces n_estimators; min_samples_leaf/max_leaf_nodes are
+    # HistGradientBoostingClassifier's depth-control knobs (no min_samples_split).
+    gb_param_distributions = {
+        "gb__max_iter": randint(100, 300),
+        "gb__learning_rate": uniform(0.02, 0.28),
+        "gb__max_depth": [None, 3, 5, 7, 10],
+        "gb__max_leaf_nodes": randint(15, 63),
+        "gb__min_samples_leaf": randint(10, 40),
+    }
+
+    # Lighter CV just for the search to keep runtime down; early_stopping on
+    # the estimator itself also caps each individual fit's tree count.
+    cv_search = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+
+    gb_random_search = RandomizedSearchCV(
+        estimator=smote_gb_pipeline,
+        param_distributions=gb_param_distributions,
+        n_iter=20,
+        cv=cv_search,
+        scoring="accuracy",
+        n_jobs=-1,
         random_state=42,
-        n_jobs=1  # left at 1 on purpose: this pipeline is also used as the
-                  # estimator inside GridSearchCV(n_jobs=-1) below, and
-                  # nesting two n_jobs=-1 levels causes oversubscription
-    ))
-])
+    )
 
-# Perform Stratified 5-Fold Cross Validation with leakage-safe SMOTE
-cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-cv_scores = cross_val_score(smote_pipeline, X_train_scaled, y_train, cv=cv, scoring='accuracy')
+    print("Running RandomizedSearchCV for Gradient Boosting...")
+    gb_random_search.fit(X_train_scaled, y_train)
+    best_gb_model = gb_random_search.best_estimator_
+    print(f"Best Parameters: {gb_random_search.best_params_}")
+    print(f"Best CV Score: {gb_random_search.best_score_:.4f}")
 
-print(f"\nK-Fold Cross Validation Scores: {cv_scores}")
-print(f"Mean CV Accuracy: {cv_scores.mean():.4f} (+/- {cv_scores.std() * 2:.4f})")
+    print("\n" + "=" * 70)
+    print("FINAL EVALUATION: TUNED GRADIENT BOOSTING ON TEST SET")
+    print("=" * 70)
 
-# Fit the pipeline on the full training set (SMOTE runs once here, only on training data) and evaluate on the untouched, non-SMOTEd test set.
-# imblearn pipelines only apply the resampler during .fit(), not .predict(), so this single predict() call is all that's needed.
-smote_pipeline.fit(X_train_scaled, y_train)
-y_pred_smote_test = smote_pipeline.predict(X_test_scaled)
+    y_pred_best_gb = best_gb_model.predict(X_test_scaled)
+    best_gb_test_accuracy = accuracy_score(y_test, y_pred_best_gb)
+    print(f"Tuned Model - Test Accuracy: {best_gb_test_accuracy:.4f}\n")
+    print(classification_report(y_test, y_pred_best_gb, target_names=TARGET_ORDER))
 
-# Evaluate performance
-smote_test_accuracy = accuracy_score(y_test, y_pred_smote_test)
-print(f"SMOTE Model Test Accuracy: {smote_test_accuracy:.4f}\n")
+    cm_best_gb = confusion_matrix(y_test, y_pred_best_gb)
+    disp_best_gb = ConfusionMatrixDisplay(confusion_matrix=cm_best_gb, display_labels=TARGET_ORDER)
+    plt.figure(figsize=(7, 6))
+    disp_best_gb.plot(cmap="Greens", values_format="d", ax=plt.gca())
+    plt.title("Tuned Gradient Boosting (Test Set)", fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig("confusion_matrix_tuned_gb.png", dpi=300)
+    plt.show()
 
-print("SMOTE Classification Report:")
-print(classification_report(y_test, y_pred_smote_test, target_names=['Low', 'Medium', 'High']))
+    print("\nFINAL GRADIENT BOOSTING COMPARISON")
+    print(f"Baseline                  - Test Accuracy : {gb_accuracy:.4f}")
+    print(f"SMOTE-balanced            - Test Accuracy : {smote_gb_test_accuracy:.4f}")
+    print(f"Tuned (RandomizedSearchCV)- Test Accuracy : {best_gb_test_accuracy:.4f}")
 
-# Generate the SMOTE Confusion Matrix
-cm_smote = confusion_matrix(y_test, y_pred_smote_test)
-disp_smote = ConfusionMatrixDisplay(
-    confusion_matrix=cm_smote,
-    display_labels=['Low', 'Medium', 'High']
-)
-
-# 18. CONFUSION MATRIX COMPARISON
-
-print("\n" + "=" * 70)
-print("CONFUSION MATRIX COMPARISON: BASELINE vs SMOTE")
-print("=" * 70)
-
-# One figure, two subplots side by side, so the two models' error patterns can be scanned at a glance instead of switching between separate figures
-fig, (ax_rf, ax_smote) = plt.subplots(1, 2, figsize=(14, 6))
-
-disp_rf.plot(cmap='Blues', ax=ax_rf, values_format='d', colorbar=False)
-ax_rf.set_title('Baseline (Class-Weighted)', fontsize=12, fontweight='bold')
-
-disp_smote.plot(cmap='Blues', ax=ax_smote, values_format='d', colorbar=False)
-ax_smote.set_title('SMOTE-Balanced', fontsize=12, fontweight='bold')
-
-fig.suptitle('Random Forest Confusion Matrices', fontsize=14, fontweight='bold')
-plt.tight_layout()
-plt.savefig('confusion_matrix_comparison.png', dpi=300)
-plt.show()
-
-# 19. CONCLUSION (BASELINE vs SMOTE)
-
-print("\n" + "=" * 70)
-print("CONCLUSION")
-print("=" * 70)
-
-print(f"\nBaseline Random Forest  - Test Accuracy : {rf_accuracy:.4f}")
-print(f"SMOTE Random Forest     - Test Accuracy : {smote_test_accuracy:.4f}")
-print(f"SMOTE Random Forest     - Mean CV Accuracy : {cv_scores.mean():.4f} "
-      f"(+/- {cv_scores.std() * 2:.4f})")
-
-better_model = "SMOTE-balanced" if smote_test_accuracy > rf_accuracy else "baseline (class-weighted)"
-print(f"\nBetter-performing model on the held-out test set: {better_model} Random Forest.")
+    return {"best_model": best_gb_model, "test_accuracy": best_gb_test_accuracy}
 
 
-# 20. HYPERPARAMETER TUNING (GRIDSEARCHCV)
+# ---------------------------------------------------------------------------
+# 6. ENTRY POINT
+# ---------------------------------------------------------------------------
 
-print("\n" + "=" * 70)
-print("HYPERPARAMETER TUNING: GRIDSEARCHCV")
-print("=" * 70)
+def main():
+    parser = argparse.ArgumentParser(description="Irrigation need prediction pipeline")
+    parser.add_argument(
+        "--model", choices=["rf", "gb", "both"], default="both",
+        help="Which model branch to run (default: both)"
+    )
+    parser.add_argument(
+        "--skip-eda", action="store_true",
+        help="Skip the plotting/EDA section (faster iteration on models)"
+    )
+    parser.add_argument(
+        "--data-path", default=DATASET_PATH,
+        help="Path to irrigation_prediction.csv"
+    )
+    args = parser.parse_args()
 
-# Grid for the 'rf' step in the ImbPipeline
-param_grid = {
-    'rf__n_estimators': [100, 200],
-    'rf__max_depth': [8, 12, 16, None],
-    'rf__min_samples_split': [2, 5, 10],
-    'rf__min_samples_leaf': [1, 2, 4]
-}
+    df = load_and_clean_data(args.data_path)
 
-# Setup GridSearch with the same Stratified K-Fold CV used above
-grid_search = GridSearchCV(
-    estimator=smote_pipeline,
-    param_grid=param_grid,
-    cv=cv,
-    scoring='accuracy',
-    n_jobs=-1
-)
+    if not args.skip_eda:
+        run_eda(df)
 
-# Run tuning
-grid_search.fit(X_train_scaled, y_train)
+    X_train_scaled, X_test_scaled, y_train, y_test, cv = preprocess(df)
 
-# Best model & parameters
-best_rf_model = grid_search.best_estimator_
-print(f"Best Parameters: {grid_search.best_params_}")
-print(f"Best CV Score: {grid_search.best_score_:.4f}")
+    results = {}
+    if args.model in ("rf", "both"):
+        results["rf"] = run_random_forest(X_train_scaled, X_test_scaled, y_train, y_test, cv)
 
-# 21. FINAL EVALUATION - TUNED MODEL ON HELD-OUT TEST SET
-# grid_search.best_score_ above is the mean CV accuracy on the training folds —
-# it's a model-selection score, not a generalization estimate. The number that
-# actually belongs in the final comparison is this model's accuracy on the
-# untouched test set.
+    if args.model in ("gb", "both"):
+        results["gb"] = run_gradient_boosting(X_train_scaled, X_test_scaled, y_train, y_test, cv)
 
-print("\n" + "=" * 70)
-print("FINAL EVALUATION: TUNED MODEL ON TEST SET")
-print("=" * 70)
+    if args.model == "both":
+        print("\n" + "=" * 70)
+        print("OVERALL CHAMPION MODEL COMPARISON")
+        print("=" * 70)
+        print(f"Tuned Random Forest      - Test Accuracy : {results['rf']['test_accuracy']:.4f}")
+        print(f"Tuned Gradient Boosting  - Test Accuracy : {results['gb']['test_accuracy']:.4f}")
 
-y_pred_best = best_rf_model.predict(X_test_scaled)
-best_test_accuracy = accuracy_score(y_test, y_pred_best)
 
-print(f"Tuned Model - Test Accuracy: {best_test_accuracy:.4f}\n")
-
-print("Tuned Model Classification Report:")
-print(classification_report(y_test, y_pred_best, target_names=['Low', 'Medium', 'High']))
-
-cm_best = confusion_matrix(y_test, y_pred_best)
-disp_best = ConfusionMatrixDisplay(
-    confusion_matrix=cm_best,
-    display_labels=['Low', 'Medium', 'High']
-)
-
-plt.figure(figsize=(7, 6))
-disp_best.plot(cmap='Blues', values_format='d', ax=plt.gca())
-plt.title('Tuned Random Forest (Test Set)', fontsize=13, fontweight='bold')
-plt.tight_layout()
-plt.savefig('confusion_matrix_tuned.png', dpi=300)
-plt.show()
-
-print("\n" + "=" * 70)
-print("FINAL MODEL COMPARISON")
-print("=" * 70)
-print(f"Baseline (class-weighted) - Test Accuracy : {rf_accuracy:.4f}")
-print(f"SMOTE-balanced            - Test Accuracy : {smote_test_accuracy:.4f}")
-print(f"Tuned (GridSearchCV)      - Test Accuracy : {best_test_accuracy:.4f}")
+if __name__ == "__main__":
+    main()
