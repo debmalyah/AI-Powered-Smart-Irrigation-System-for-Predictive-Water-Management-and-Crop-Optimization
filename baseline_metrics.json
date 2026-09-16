@@ -1,0 +1,26 @@
+{
+  "model_name": "Baseline_LogisticRegression",
+  "dummy_floor": {
+    "val": {
+      "accuracy": 0.5865,
+      "precision": 0.34398225000000004,
+      "recall": 0.5865,
+      "f1_score": 0.4336366214938544
+    },
+    "test": {
+      "accuracy": 0.5865,
+      "precision": 0.34398225000000004,
+      "recall": 0.5865,
+      "f1_score": 0.4336366214938544
+    }
+  },
+  "val_accuracy": 0.834,
+  "val_precision": 0.8323073001741501,
+  "val_recall": 0.834,
+  "val_f1_score": 0.8315240999783411,
+  "test_accuracy": 0.8225,
+  "test_precision": 0.8212075421489595,
+  "test_recall": 0.8225,
+  "test_f1_score": 0.820299472891956,
+  "artifact_path": "baseline_irrigation_model.joblib"
+}

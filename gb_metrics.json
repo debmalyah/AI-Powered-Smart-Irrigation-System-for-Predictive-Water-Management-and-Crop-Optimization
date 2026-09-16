@@ -1,0 +1,19 @@
+{
+  "model_name": "Gradient_Boosting",
+  "val_accuracy": 0.988,
+  "val_precision": 0.9881197190216292,
+  "val_recall": 0.988,
+  "val_f1_score": 0.9880392679367227,
+  "test_accuracy": 0.989,
+  "test_precision": 0.9894590953056006,
+  "test_recall": 0.989,
+  "test_f1_score": 0.9891259063859186,
+  "artifact_path": "gb_irrigation_model.joblib",
+  "best_params": {
+    "gb__learning_rate": 0.19011255853240275,
+    "gb__max_depth": 10,
+    "gb__max_iter": 172,
+    "gb__max_leaf_nodes": 53,
+    "gb__min_samples_leaf": 27
+  }
+}

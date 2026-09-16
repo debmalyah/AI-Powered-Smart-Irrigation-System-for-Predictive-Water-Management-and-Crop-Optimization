@@ -1,0 +1,13 @@
+{
+  "model_name": "LSTM_SlidingWindow",
+  "val_accuracy": 0.4616541353383459,
+  "val_precision": 0.4854435108751781,
+  "val_recall": 0.4616541353383459,
+  "val_f1_score": 0.47208302357613474,
+  "test_accuracy": 0.44511278195488724,
+  "test_precision": 0.4735962573443709,
+  "test_recall": 0.44511278195488724,
+  "test_f1_score": 0.4576587086650006,
+  "artifact_path": "lstm_irrigation_model.keras",
+  "caveat": "irrigation_prediction.csv has no timestamp/sequence key, so the windows this model was trained on are not genuinely sequential. This result is kept as a documented negative finding -- it justifies treating the problem as tabular classification (baseline/RF/GB), not as evidence this architecture needs more tuning. Do not add this model to select_best_model.py's CANDIDATES."
+}

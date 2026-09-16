@@ -1,0 +1,19 @@
+{
+  "model_name": "Random_Forest",
+  "val_accuracy": 0.995,
+  "val_precision": 0.9950183246073299,
+  "val_recall": 0.995,
+  "val_f1_score": 0.9949757924490208,
+  "test_accuracy": 0.9965,
+  "test_precision": 0.9965017748785726,
+  "test_recall": 0.9965,
+  "test_f1_score": 0.9965006175098023,
+  "artifact_path": "rf_irrigation_model.joblib",
+  "best_params": {
+    "max_depth": 20,
+    "max_features": null,
+    "min_samples_leaf": 2,
+    "min_samples_split": 13,
+    "n_estimators": 393
+  }
+}
